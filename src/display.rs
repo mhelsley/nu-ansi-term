@@ -7,6 +7,14 @@ use std::fmt;
 use std::io;
 
 #[derive(Eq, PartialEq, Debug)]
+enum PromptKind {
+    Initial,
+    Continuation,
+    Right,
+    Secondary,
+}
+
+#[derive(Eq, PartialEq, Debug)]
 enum OSControl<'a, S: 'a + ToOwned + ?Sized>
 where
     <S as ToOwned>::Owned: fmt::Debug,
@@ -15,6 +23,17 @@ where
     Icon,
     Cwd,
     Link { url: Cow<'a, S> },
+    CommandBegin {
+        aid: Option<Cow<'a, S>>,
+    },
+    Prompt { kind: Option<PromptKind>, },
+    CommandInputBegin,
+    CommandOutputBegin,
+    CommandExit {
+        aid: Option<Cow<'a, S>>,
+        excode: Option<u8>,
+        error: Cow<'a, S>,
+    },
 }
 
 impl<'a, S: 'a + ToOwned + ?Sized> Clone for OSControl<'a, S>
@@ -27,6 +46,18 @@ where
             Self::Title => Self::Title,
             Self::Icon => Self::Icon,
             Self::Cwd => Self::Cwd,
+
+            Self::CommandBegin { aid: Some(id) } => Self::CommandBegin { aid: Some(id.clone()) },
+            Self::CommandBegin { aid: None } => Self::CommandBegin { aid: None },
+            Self::Prompt { kind: k } => Self::Prompt { kind: *k },
+            Self::CommandInputBegin => Self::CommandInputBegin,
+            Self::CommandOutputBegin => Self::CommandOutputBegin,
+            Self::CommandExit { aid: id, excode: code, error: err } =>
+                Self::CommandExit {
+                    aid: id.clone(),
+                    excode: *code,
+                    error: err.clone(),
+                },
         }
     }
 }
@@ -257,6 +288,49 @@ where
             _ => None,
         }
     }
+
+    pub fn command_begin<I>(&self, id: I) -> Option<Self>
+    where
+        I: Into<Option<Cow<'a, S>>>,
+    {
+        Some(Self {
+            style: self.style,
+            string: Cow::<'a, S>::default(),
+            oscontrol: Some(OSControl::CommandBegin {
+                    aid: id.into(),
+                }),
+        })
+    }
+
+    pub fn command<I>(&self, s: I) -> Option<Self>
+    where
+        I: Into<Cow<'a, S>>,
+    {
+        match self.oscontrol {
+            Some(OSControl::<'a, S>::Prompt) | Some(OSControl::<'a, S>::Command) => Some(Self {
+                style: self.style,
+                string: s.into(),
+                oscontrol: Some(OSControl::<'a, S>::Command),
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn command_output_begin<I>(&self, s: I) -> Option<Self>
+    where
+        I: Into<Cow<'a, S>>,
+    {
+        match self.oscontrol {
+            Some(OSControl::<'a, S>::Command) | Some(OSControl::<'a, S>::CommandOutputBegin) => {
+                Some(Self {
+                    style: self.style,
+                    string: s.into(),
+                    oscontrol: Some(OSControl::<'a, S>::CommandOutputBegin),
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// A set of `AnsiGenericStrings`s collected together, in order to be
@@ -376,6 +450,18 @@ where
                 write!(w, "\x01\x1B]7;")?;
                 w.write_str(self.string.as_ref())?;
                 write!(w, "\x1B\x5C\x02")
+            }
+            Some(OSControl::Prompt) => {
+                // TODO
+                w.write_str(self.string.as_ref())
+            }
+            Some(OSControl::Command) => {
+                // TODO
+                w.write_str(self.string.as_ref())
+            }
+            Some(OSControl::CommandOutputBegin) => {
+                // TODO
+                w.write_str(self.string.as_ref())
             }
             None => w.write_str(self.string.as_ref()),
         }
