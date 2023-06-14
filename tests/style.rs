@@ -23,6 +23,7 @@ fn manual_instance_style() {
         is_hidden: false,
         is_strikethrough: false,
         with_reset: false,
+        break_crate_api: false,
     };
     assert_eq!(Style::default(), s);
 }

@@ -47,6 +47,9 @@ pub struct Style {
 
     /// Wether this style starts with reset code
     pub with_reset: bool,
+
+    /// Test breaking API
+    pub(crate) break_crate_api: bool,
 }
 
 impl Style {
@@ -290,6 +293,7 @@ impl Default for Style {
             is_hidden: false,
             is_strikethrough: false,
             with_reset: false,
+            break_crate_api: false,
         }
     }
 }
@@ -659,6 +663,6 @@ mod serde_json_tests {
     fn style_serialization() {
         let style = Style::default();
 
-        assert_eq!(serde_json::to_string(&style).unwrap(), "{\"foreground\":null,\"background\":null,\"is_bold\":false,\"is_dimmed\":false,\"is_italic\":false,\"is_underline\":false,\"is_blink\":false,\"is_reverse\":false,\"is_hidden\":false,\"is_strikethrough\":false,\"with_reset\":false}".to_string());
+        assert_eq!(serde_json::to_string(&style).unwrap(), "{\"foreground\":null,\"background\":null,\"is_bold\":false,\"is_dimmed\":false,\"is_italic\":false,\"is_underline\":false,\"is_blink\":false,\"is_reverse\":false,\"is_hidden\":false,\"is_strikethrough\":false,\"with_reset\":false,\"break_crate_api\":false,}".to_string());
     }
 }
