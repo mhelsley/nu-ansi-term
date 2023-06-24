@@ -310,7 +310,12 @@ where
     &'a S: AsRef<[u8]>,
 {
     // write the part within the styling prefix and suffix
-    fn write_inner<W: AnyWrite<Wstr = S> + ?Sized>(&self, w: &mut W) -> Result<(), W::Error> {
+    fn write_inner<W: AnyWrite<Wstr = S> + ?Sized>(
+        &self,
+        w: &mut W,
+        in_zw: &mut bool,
+        wrap_zw_continues: bool,
+    ) -> Result<(), W::Error> {
         let zwbegin: &str;
         let zwend: &str;
         match self.wrap_zw {
@@ -327,27 +332,80 @@ where
                 zwend = "";
             }
         }
+
+        macro_rules! OSC {
+            ($code:literal) => {
+                if !*in_zw && !self.wrap_zw.is_some() {
+                    write!(w, "{}\x1B]{};", zwbegin, $code)?;
+                    *in_zw = true;
+                } else {
+                    write!(w, "\x1B]{};", $code)?;
+                }
+            }
+        }
+
+        // Emit OSC String Terminator
+        macro_rules! OSC_ST {
+            () => {
+                if *in_zw && !wrap_zw_continues {
+                    *in_zw = false;
+                    write!(w, "\x1B\x5C{}", zwend)
+                } else {
+                    write!(w, "\x1B\x5C")
+                }
+            }
+        }
+
         match &self.oscontrol {
             Some(OSControl::Link { url: u }) => {
-                write!(w, "{}\x1B]8;;", zwbegin)?;
+                OSC!("8;");
                 w.write_str(u.as_ref())?;
-                write!(w, "\x1B\x5C{}", zwend)?;
+                if self.wrap_zw.is_some() {
+                    write!(w, "\x1B\x5C{}", zwend)?;
+                    *in_zw = false;
+                } else {
+                    write!(w, "\x1B\x5C")?;
+                }
                 w.write_str(self.string.as_ref())?;
-                write!(w, "{}\x1B]8;;\x1B\x5C{}", zwbegin, zwend)
+                OSC!("8;");
+                OSC_ST!()
             }
             Some(OSControl::Title) => {
-                write!(w, "{}\x1B]2;", zwbegin)?;
+                OSC!("2");
                 w.write_str(self.string.as_ref())?;
-                write!(w, "\x1B\x5C{}", zwend)
+                OSC_ST!()
             }
-            None => w.write_str(self.string.as_ref()),
+            None => {
+                if *in_zw {
+                    write!(w, "{}", zwend)?;
+                    *in_zw = false;
+                }
+                w.write_str(self.string.as_ref())
+            }
         }
     }
 
     fn write_to_any<W: AnyWrite<Wstr = S> + ?Sized>(&self, w: &mut W) -> Result<(), W::Error> {
-        write!(w, "{}", self.style.prefix())?;
-        self.write_inner(w)?;
-        write!(w, "{}", self.style.suffix())
+        let zwbegin: &str;
+        let zwend: &str;
+        match self.wrap_zw {
+            Some(Wrapping::CtrlACtrlB) => {
+                zwbegin = "\x01";
+                zwend = "\x02";
+            }
+            Some(Wrapping::Str(begins, ends)) => {
+                zwbegin = &begins;
+                zwend = &ends;
+            }
+            None => {
+                zwbegin = &"";
+                zwend = &"";
+            }
+        }
+        let mut in_zw: bool = true;
+        write!(w, "{}{}", zwbegin, self.style.prefix())?;
+        self.write_inner(w, &mut in_zw, self.wrap_zw.is_some())?;
+        write!(w, "{}{}", self.style.suffix(), zwend)
     }
 }
 
@@ -377,32 +435,96 @@ where
 {
     fn write_to_any<W: AnyWrite<Wstr = S> + ?Sized>(&self, w: &mut W) -> Result<(), W::Error> {
         use self::Difference::*;
+        let mut zwbegin: &str;
+        let mut zwend: &str;
 
         let first = match self.0.first() {
             None => return Ok(()),
             Some(f) => f,
         };
 
-        write!(w, "{}", first.style.prefix())?;
-        first.write_inner(w)?;
+        match first.wrap_zw {
+            Some(Wrapping::CtrlACtrlB) => {
+                zwbegin = "\x01";
+                zwend = "\x02";
+            }
+            Some(Wrapping::Str(begins, ends)) => {
+                zwbegin = &begins;
+                zwend = &ends;
+            }
+            None => {
+                zwbegin = &"";
+                zwend = &"";
+            }
+        }
+        let mut styling = !first.style.is_plain();
+
+        let mut in_zw = false; // in zero-width and wrap_zw was set
+        let mut wrap_zw_continues = first.wrap_zw.is_some()
+            && match self.0.get(1) {
+                None => false,
+                Some(second) => second.wrap_zw.is_some(),
+            };
+
+        if first.wrap_zw.is_some() {
+            write!(w, "{}{}", first.style.prefix(), zwbegin)?;
+            in_zw = true;
+        } else {
+            write!(w, "{}", first.style.prefix())?;
+        }
+        first.write_inner(w, &mut in_zw, wrap_zw_continues)?;
 
         for window in self.0.windows(2) {
+            wrap_zw_continues = window[0].wrap_zw.is_some() && window[1].wrap_zw.is_some();
+            styling |= !window[1].style.is_plain();
+            match window[1].wrap_zw {
+                Some(Wrapping::CtrlACtrlB) => {
+                    zwbegin = "\x01";
+                    zwend = "\x02";
+                }
+                Some(Wrapping::Str(begins, ends)) => {
+                    zwbegin = &begins;
+                    zwend = &ends;
+                }
+                None => {
+                    zwbegin = &"";
+                    zwend = &"";
+                }
+            }
             match Difference::between(&window[0].style, &window[1].style) {
-                ExtraStyles(style) => write!(w, "{}", style.prefix())?,
-                Reset => write!(w, "{}{}", RESET, window[1].style.prefix())?,
+                ExtraStyles(style) => {
+                    if !in_zw {
+                        in_zw = true;
+                        write!(w, "{}{}", style.prefix(), zwbegin)?
+                    } else {
+                        write!(w, "{}", style.prefix())?
+                    }
+                }
+                Reset => {
+                    styling = false;
+                    write!(w, "{}{}", RESET, window[1].style.prefix())?
+                }
                 Empty => { /* Do nothing! */ }
             }
 
-            window[1].write_inner(w)?;
+            window[1].write_inner(w, &mut in_zw, wrap_zw_continues)?;
         }
 
         // Write the final reset string after all of the AnsiStrings have been
         // written, *except* if the last one has no styles, because it would
         // have already been written by this point.
         if let Some(last) = self.0.last() {
-            if !last.style.is_plain() {
-                write!(w, "{}", RESET)?;
-            }
+            if styling || !last.style.is_plain() {
+                if in_zw {
+                    write!(w, "{}{}", RESET, zwend)?;
+                } else {
+                    if last.wrap_zw.is_some() {
+                        write!(w, "{}{}{}", zwbegin, RESET, zwend)?;
+                    } else {
+                        write!(w, "{}", RESET)?;
+                    }
+                }
+             }
         }
 
         Ok(())
@@ -483,8 +605,10 @@ mod tests {
 
     #[test]
     fn title() {
-        let title = AnsiGenericString::title("Test Title");
-        assert_eq!(title.clone().to_string(), "\x1B]2;Test Title\x1B\\\\");
+        let mut title = AnsiGenericString::title("Test Title");
+        assert_eq!(title.clone().to_string(), "\x1B]2;Test Title\x1B\\");
+        title.wrap_zw = Some(Wrapping::CtrlACtrlB);
+        assert_eq!(title.clone().to_string(), "\x01\x1B]2;Test Title\x1B\\\x02");
         idempotent(title)
     }
 
@@ -495,7 +619,7 @@ mod tests {
         styled.hyperlink("https://example.com");
         assert_eq!(
             styled.to_string(),
-            "\x1B[31m\x01\x1B]8;;https://example.com\x1B\\\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\\\x02\x1B[0m"
+            "\x1B[31m\x01\x1B]8;;https://example.com\x1B\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\x02\x1B[0m"
         );
     }
 
@@ -510,29 +634,29 @@ mod tests {
         // Assemble with link by itself
         let joined = AnsiStrings(&[link.clone()]).to_string();
         #[cfg(feature = "gnu_legacy")]
-        assert_eq!(joined, format!("\x1B[04;34m\x01\x1B]8;;https://example.com\x1B\\\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\\\x02\x1B[0m"));
+        assert_eq!(joined, format!("\x1B[04;34m\x01\x1B]8;;https://example.com\x1B\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\x02\x1B[0m"));
         #[cfg(not(feature = "gnu_legacy"))]
-        assert_eq!(joined, format!("\x1B[4;34m\x01\x1B]8;;https://example.com\x1B\\\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\\\x02\x1B[0m"));
+        assert_eq!(joined, format!("\x1B[4;34m\x01\x1B]8;;https://example.com\x1B\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\x02\x1B[0m"));
 
         // Assemble with link in the middle
         let joined = AnsiStrings(&[before.clone(), link.clone(), after.clone()]).to_string();
         #[cfg(feature = "gnu_legacy")]
-        assert_eq!(joined, format!("\x1B[32mBefore link. \x1B[04;34m\x01\x1B]8;;https://example.com\x1B\\\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\\\x02\x1B[0m\x1B[32m After link.\x1B[0m"));
+        assert_eq!(joined, format!("\x1B[32mBefore link. \x1B[04;34m\x01\x1B]8;;https://example.com\x1B\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\x02\x1B[0m\x1B[32m After link.\x1B[0m"));
         #[cfg(not(feature = "gnu_legacy"))]
-        assert_eq!(joined, format!("\x1B[32mBefore link. \x1B[4;34m\x01\x1B]8;;https://example.com\x1B\\\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\\\x02\x1B[0m\x1B[32m After link.\x1B[0m"));
+        assert_eq!(joined, format!("\x1B[32mBefore link. \x1B[4;34m\x01\x1B]8;;https://example.com\x1B\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\x02\x1B[0m\x1B[32m After link.\x1B[0m"));
 
         // Assemble with link first
         let joined = AnsiStrings(&[link.clone(), after.clone()]).to_string();
         #[cfg(feature = "gnu_legacy")]
-        assert_eq!(joined, format!("\x1B[04;34m\x01\x1B]8;;https://example.com\x1B\\\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\\\x02\x1B[0m\x1B[32m After link.\x1B[0m"));
+        assert_eq!(joined, format!("\x1B[04;34m\x01\x1B]8;;https://example.com\x1B\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\x02\x1B[0m\x1B[32m After link.\x1B[0m"));
         #[cfg(not(feature = "gnu_legacy"))]
-        assert_eq!(joined, format!("\x1B[4;34m\x01\x1B]8;;https://example.com\x1B\\\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\\\x02\x1B[0m\x1B[32m After link.\x1B[0m"));
+        assert_eq!(joined, format!("\x1B[4;34m\x01\x1B]8;;https://example.com\x1B\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\x02\x1B[0m\x1B[32m After link.\x1B[0m"));
 
         // Assemble with link at the end
         let joined = AnsiStrings(&[before.clone(), link.clone()]).to_string();
         #[cfg(feature = "gnu_legacy")]
-        assert_eq!(joined, format!("\x1B[32mBefore link. \x1B[04;34m\x01\x1B]8;;https://example.com\x1B\\\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\\\x02\x1B[0m"));
+        assert_eq!(joined, format!("\x1B[32mBefore link. \x1B[04;34m\x01\x1B]8;;https://example.com\x1B\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\x02\x1B[0m"));
         #[cfg(not(feature = "gnu_legacy"))]
-        assert_eq!(joined, format!("\x1B[32mBefore link. \x1B[4;34m\x01\x1B]8;;https://example.com\x1B\\\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\\\x02\x1B[0m"));
+        assert_eq!(joined, format!("\x1B[32mBefore link. \x1B[4;34m\x01\x1B]8;;https://example.com\x1B\\\x02Link to example.com.\x01\x1B]8;;\x1B\\\x02\x1B[0m"));
     }
 }
